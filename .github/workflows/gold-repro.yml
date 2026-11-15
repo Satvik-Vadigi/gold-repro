@@ -1,0 +1,75 @@
+name: gold-repro
+# Independent reproduction of the MYAI GOLD run: fresh clone at the pinned commit,
+# provenance check against the recorded tree SHA, then verify/build/vet/test on a
+# native Linux kernel (fswatch/fanotify works here, unlike on Colab).
+on: workflow_dispatch
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Fresh checkout at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/TypeScript
+          ref: bdec15a7b3a4a82a076f93344fb6011d6ba309c3
+          path: src
+
+      - name: Provenance - root tree must equal recorded pinned tree
+        run: |
+          got="$(git -C src rev-parse 'HEAD^{tree}')"
+          echo "HEAD=$(git -C src rev-parse HEAD) TREE=$got"
+          test "$(git -C src rev-parse HEAD)" = "bdec15a7b3a4a82a076f93344fb6011d6ba309c3"
+          test "$got" = "7dacebfcb398a5e749218dd0c50ebd92b750abe6"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Node dependencies (astnav tests need the TypeScript package)
+        working-directory: src
+        run: npm ci --ignore-scripts
+
+      - name: Verify, build, vet
+        working-directory: src/tsc
+        run: |
+          go version
+          go mod verify
+          go build ./...
+          go vet ./...
+
+      - name: Full test run (never aborts the job, rc is recorded)
+        working-directory: src/tsc
+        run: |
+          set +e
+          go test -json ./... > "$GITHUB_WORKSPACE/full_tsc_test.jsonl" 2> "$GITHUB_WORKSPACE/stderr.txt"
+          echo "$?" > "$GITHUB_WORKSPACE/rc.txt"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### rc: $(cat rc.txt)"
+            echo "test-level totals:"
+            jq -r 'select(.Test!=null and (.Action=="pass" or .Action=="fail" or .Action=="skip")) | .Action' full_tsc_test.jsonl | sort | uniq -c
+            echo "failed packages:"
+            jq -r 'select(.Test==null and .Action=="fail") | .Package' full_tsc_test.jsonl | sort -u
+            echo "sha256 of log:"
+            sha256sum full_tsc_test.jsonl
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gold-repro-evidence
+          path: |
+            full_tsc_test.jsonl
+            stderr.txt
+            rc.txt
